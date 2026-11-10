@@ -1,0 +1,2485 @@
+#!/usr/bin/env python3
+"""V4.0.0 strategy-driven python-pptx builder for pro-ppt-studio."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+from PIL import Image
+from pptx import Presentation
+from pptx.chart.data import CategoryChartData
+from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_LEGEND_POSITION, XL_CHART_TYPE
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.oxml.ns import qn
+from pptx.util import Inches, Pt
+
+import dynamic_pptx
+
+from level_profiles import (
+    LEVEL_PROFILES,
+    SKILL_VERSION,
+    LevelProfile,
+    font_stack,
+    get_profile,
+    normalize_level,
+    resolve_layout,
+)
+
+
+SLIDE_W = 13.333
+SLIDE_H = 7.5
+
+
+def rgb(value: str) -> RGBColor:
+    value = value.lstrip("#")
+    if len(value) != 6:
+        raise ValueError(f"Expected a 6-digit hex color, got {value!r}")
+    return RGBColor(int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+
+
+def set_cjk_font(run, family: str) -> None:
+    run.font.name = family
+    r_pr = run._r.get_or_add_rPr()
+    ea = r_pr.find(qn("a:ea"))
+    if ea is None:
+        ea = r_pr.makeelement(qn("a:ea"), {})
+        r_pr.append(ea)
+    ea.set("typeface", family)
+
+
+def set_fill_alpha(shape, opacity: float) -> None:
+    solid_fill = shape.fill._xPr.find(qn("a:solidFill"))
+    if solid_fill is None:
+        return
+    color = solid_fill.find(qn("a:srgbClr"))
+    if color is None:
+        return
+    alpha = color.find(qn("a:alpha"))
+    if alpha is None:
+        alpha = color.makeelement(qn("a:alpha"), {})
+        color.append(alpha)
+    alpha.set("val", str(int(max(0.0, min(opacity, 1.0)) * 100000)))
+
+
+def normalize_chart_axis_ids(chart) -> None:
+    nodes = chart._chartSpace.findall(".//" + qn("c:axId"))
+    mapping: dict[str, str] = {}
+    next_id = 50000001
+    for node in nodes:
+        old = node.get("val")
+        if not old:
+            continue
+        if old not in mapping:
+            mapping[old] = str(next_id)
+            next_id += 1
+        node.set("val", mapping[old])
+    for node in chart._chartSpace.findall(".//" + qn("c:crossAx")):
+        old = node.get("val")
+        if old in mapping:
+            node.set("val", mapping[old])
+
+
+def _is_dark(hex_color: str) -> bool:
+    value = hex_color.lstrip("#")
+    red, green, blue = (int(value[index : index + 2], 16) for index in (0, 2, 4))
+    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    return luminance < 140
+
+
+class LeveledDeckBuilder:
+    """Create editable slides under a machine-readable expression strategy."""
+
+    def __init__(
+        self,
+        level: str,
+        *,
+        style_branch: str | None = None,
+        width_inches: float = SLIDE_W,
+        height_inches: float = SLIDE_H,
+        style: str | None = None,
+        mode: str = "static",
+        template_style: Mapping[str, Any] | None = None,
+        animation_plan: Mapping[str, Any] | None = None,
+    ) -> None:
+        normalized_level = normalize_level(level)
+        requested_branch = style_branch or style
+        if normalized_level == "L4" and requested_branch is None:
+            requested_branch = LEVEL_PROFILES["L4"].style_branches[0].key
+        self.profile: LevelProfile = get_profile(normalized_level, requested_branch)
+        self.style_branch = self.profile.style_branch(requested_branch)
+        self.fonts = font_stack(self.profile.level, requested_branch)
+        self.mode = mode.strip().lower()
+        if self.mode not in {"static", "dynamic"}:
+            raise ValueError("mode must be 'static' or 'dynamic'")
+        if self.profile.level == "L1" and self.mode == "dynamic":
+            raise ValueError("L1 is a static-only information strategy")
+        self.template_style: dict[str, Any] | None = None
+        self.animation_plan: dict[str, Any] = dict(animation_plan or {})
+        self._animation_steps: dict[int, list[dict[str, Any]]] = {}
+        self._transition_by_slide: dict[int, dict[str, Any]] = {}
+        self.presentation = Presentation()
+        self.presentation.slide_width = Inches(width_inches)
+        self.presentation.slide_height = Inches(height_inches)
+        self.presentation.core_properties.title = (
+            f"pro-ppt-studio {SKILL_VERSION} - {self.profile.strategy.name}"
+        )
+        self.presentation.core_properties.subject = (
+            f"Strategy {self.profile.strategy.key}; level {self.profile.level}"
+        )
+        self.presentation.core_properties.keywords = (
+            f"pro-ppt-studio {SKILL_VERSION}, {self.profile.strategy.key}"
+            + (
+                f", {self.style_branch.key}"
+                if self.style_branch
+                else ""
+            )
+        )
+        self.presentation.core_properties.comments = (
+            "Generated by the strategy-aware pro-ppt-studio builder."
+        )
+        self._slide_number = 0
+        self.slide_audit: list[dict] = []
+        if template_style is not None:
+            self.apply_template_style(template_style)
+
+    @property
+    def version(self) -> str:
+        return SKILL_VERSION
+
+    def apply_template_style(
+        self,
+        template_config: Any,
+        *,
+        target_level: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply migrated template tokens without crossing the level boundary.
+
+        A raw parser result is passed through ``style_migrator`` automatically.
+        An already migrated config is validated again so callers cannot bypass
+        the level contract.
+        """
+
+        from style_migrator import migrate_template
+
+        requested_level = target_level or self.profile.level
+        if requested_level != self.profile.level:
+            raise ValueError(
+                f"Template target {requested_level} does not match builder "
+                f"level {self.profile.level}"
+            )
+        raw_config = (
+            dict(template_config)
+            if isinstance(template_config, Mapping)
+            else template_config.as_dict()
+            if hasattr(template_config, "as_dict")
+            else None
+        )
+        if raw_config is None:
+            raise TypeError("template_config must be a mapping or expose as_dict()")
+        migrated = (
+            dict(raw_config)
+            if raw_config.get("target_level") == self.profile.level
+            and raw_config.get("retained")
+            else migrate_template(
+                raw_config,
+                self.profile.level,
+                style_branch=(
+                    self.style_branch.key if self.style_branch else None
+                ),
+            )
+        )
+        # Re-normalise accepted values through the same boundary filter.
+        if migrated.get("target_level") != self.profile.level:
+            migrated = migrate_template(
+                migrated,
+                self.profile.level,
+                style_branch=(
+                    self.style_branch.key if self.style_branch else None
+                ),
+            )
+        palette = dict(migrated.get("palette") or self.profile.palette)
+        fonts = dict(migrated.get("fonts") or {})
+        grid_values = dict(migrated.get("grid") or {})
+        allowed_grid = {
+            "columns",
+            "margin_left_in",
+            "margin_right_in",
+            "margin_top_in",
+            "margin_bottom_in",
+            "gutter_in",
+            "component_radius_in",
+            "shadow_policy",
+        }
+        grid = replace(
+            self.profile.grid,
+            **{
+                key: value
+                for key, value in grid_values.items()
+                if key in allowed_grid
+                and value is not None
+                and key in self.profile.grid.__dataclass_fields__
+            },
+        )
+        self.profile = replace(self.profile, palette=palette, grid=grid)
+        for role in ("title", "subtitle", "module", "section", "body", "accent", "numeric", "caption"):
+            if fonts.get(role):
+                self.fonts[role] = fonts[role]
+        self.template_style = migrated
+        return migrated
+
+    def _assert_motion(self, effect: str, category: str) -> None:
+        rule = self.profile.animation
+        if self.mode != "dynamic":
+            raise ValueError("Dynamic motion requires mode='dynamic'")
+        if category == "transition":
+            allowed = rule.transition_types
+        elif category == "emphasis":
+            allowed = rule.emphasis_types
+        elif category == "path":
+            if not rule.allow_motion_path:
+                raise ValueError(f"{self.profile.level} does not allow motion paths")
+            allowed = ("motion_path",)
+        elif category == "exit":
+            if not rule.allow_exit:
+                raise ValueError(f"{self.profile.level} does not allow exit animation")
+            allowed = rule.entrance_types
+        else:
+            allowed = rule.entrance_types
+        if effect not in allowed:
+            raise ValueError(
+                f"{self.profile.level} does not allow {category} effect {effect!r}; "
+                f"allowed={list(allowed)}"
+            )
+
+    def set_page_transition(
+        self,
+        slide,
+        effect: str | None = None,
+        *,
+        duration_ms: int | None = None,
+        advance_ms: int | None = None,
+    ) -> None:
+        """Apply a level-authorised page transition."""
+
+        rule = self.profile.animation
+        selected = effect or rule.default_transition
+        self._assert_motion(selected, "transition")
+        low, high = rule.duration_range_ms
+        duration = duration_ms or max(low, min(650, high))
+        if not low <= duration <= high:
+            raise ValueError(
+                f"{self.profile.level} transition duration must be "
+                f"{low}-{high} ms, got {duration}"
+            )
+        dynamic_pptx.set_transition(
+            slide,
+            selected,
+            duration_ms=duration,
+            advance_ms=advance_ms,
+        )
+        self._transition_by_slide[id(slide)] = {
+            "effect": selected,
+            "duration_ms": duration,
+            "advance_ms": advance_ms,
+        }
+
+    def add_shape_animation(
+        self,
+        slide,
+        shape,
+        effect: str = "fade",
+        *,
+        category: str = "entrance",
+        duration_ms: int | None = None,
+        delay_ms: int = 0,
+        trigger: str = "with",
+    ) -> None:
+        """Queue a level-authorised object animation for the slide."""
+
+        self._assert_motion(effect, category)
+        if trigger not in {"click", "with", "after"}:
+            raise ValueError("trigger must be click, with, or after")
+        if trigger == "click" and not self.profile.animation.allow_trigger:
+            # A main click sequence is still valid for L2/L3; the trigger flag
+            # controls custom triggers, not normal PowerPoint click groups.
+            pass
+        steps = self._animation_steps.setdefault(id(slide), [])
+        limit = self.profile.animation.max_element_animations
+        if limit is not None and len(steps) >= limit:
+            raise ValueError(
+                f"{self.profile.level} allows at most {limit} element animations per slide"
+            )
+        low, high = self.profile.animation.duration_range_ms
+        duration = duration_ms or max(low, min(650, high))
+        if not low <= duration <= high:
+            raise ValueError(
+                f"{self.profile.level} animation duration must be "
+                f"{low}-{high} ms, got {duration}"
+            )
+        steps.append(
+            {
+                "shape_id": int(shape.shape_id),
+                "effect": effect,
+                "duration_ms": duration,
+                "delay_ms": int(delay_ms),
+                "trigger": trigger,
+                "category": category,
+            }
+        )
+        dynamic_pptx.animate(
+            slide,
+            [
+                {
+                    key: value
+                    for key, value in step.items()
+                    if key != "category"
+                    and key != "kind"
+                }
+                | {"kind": step["category"]}
+                for step in steps
+            ],
+        )
+
+    def add_media(
+        self,
+        slide,
+        media_path: str | Path,
+        *,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+        poster_path: str | Path | None = None,
+        play_mode: str = "click",
+        loop: bool = False,
+        volume: float = 0.8,
+    ):
+        """Embed level-authorised audio or video."""
+
+        if self.mode != "dynamic":
+            raise ValueError("Media payloads require mode='dynamic'")
+        if not self.profile.animation.allow_media:
+            raise ValueError(f"{self.profile.level} does not allow audio/video media")
+        shape = dynamic_pptx.add_media(
+            slide,
+            media_path,
+            left_in=x,
+            top_in=y,
+            width_in=width,
+            height_in=height,
+            poster_path=poster_path,
+            play_mode=play_mode,
+            loop=loop,
+            volume=volume,
+        )
+        self.slide_audit[-1]["media"] = {
+            "path": str(media_path),
+            "play_mode": play_mode,
+            "loop": loop,
+        }
+        return shape
+
+    def _motion_candidates(self, slide) -> list:
+        candidates = []
+        for shape in slide.shapes:
+            try:
+                area = int(shape.width or 0) * int(shape.height or 0)
+                text = shape.text_frame.text.strip() if getattr(shape, "has_text_frame", False) else ""
+            except Exception:
+                area = 0
+                text = ""
+            if area <= 0:
+                continue
+            if text and len(text) <= 3 and int(shape.width or 0) < Inches(1):
+                continue
+            candidates.append((area, int(shape.top or 0), int(shape.left or 0), shape))
+        candidates.sort(key=lambda item: (item[1], item[2], -item[0]))
+        return [item[-1] for item in candidates]
+
+    def finalize_dynamic(self) -> dict[str, Any]:
+        """Apply default transitions and restrained object choreography."""
+
+        if self.mode != "dynamic":
+            return {"mode": "static", "animated_slides": 0}
+        rule = self.profile.animation
+        plan_entries = {
+            int(item.get("index", item.get("page", 0))): item
+            for item in self.animation_plan.get("slides", [])
+            if isinstance(item, Mapping)
+        }
+        for index, slide in enumerate(self.presentation.slides, 1):
+            plan = plan_entries.get(index, {})
+            if id(slide) not in self._transition_by_slide:
+                effect = plan.get("transition") or rule.default_transition
+                if self.profile.level == "L3":
+                    cycle = ("fade", "push_left", "wipe_right", "morph")
+                    if not plan.get("transition"):
+                        effect = cycle[(index - 1) % len(cycle)]
+                self.set_page_transition(slide, effect)
+            for order, action in enumerate(plan.get("animations", [])):
+                if not isinstance(action, Mapping):
+                    continue
+                shape = None
+                shape_id = action.get("shape_id")
+                shape_index = action.get("shape_index")
+                if shape_id is not None:
+                    shape = next(
+                        (
+                            candidate
+                            for candidate in slide.shapes
+                            if int(candidate.shape_id) == int(shape_id)
+                        ),
+                        None,
+                    )
+                elif shape_index is not None:
+                    shapes = list(slide.shapes)
+                    position = int(shape_index)
+                    if 0 <= position < len(shapes):
+                        shape = shapes[position]
+                if shape is None:
+                    raise ValueError(
+                        f"Animation plan slide {index} references a missing shape"
+                    )
+                self.add_shape_animation(
+                    slide,
+                    shape,
+                    action.get("effect", "fade"),
+                    category=action.get("category", "entrance"),
+                    duration_ms=action.get("duration_ms"),
+                    delay_ms=action.get("delay_ms", order * rule.stagger_ms),
+                    trigger=action.get("trigger", "with"),
+                )
+            if id(slide) in self._animation_steps:
+                continue
+            candidates = self._motion_candidates(slide)
+            if self.profile.level == "L2":
+                selected = candidates[:1]
+                effects = ("fade",)
+            elif self.profile.level == "L3":
+                selected = candidates[: min(3, rule.max_element_animations or 3)]
+                effects = ("wipe_up", "fade", "fly_up")
+            else:
+                selected = candidates[: min(6, len(candidates))]
+                effects = ("fade", "fly_up", "box", "wipe_up", "circle", "zoom")
+            for order, shape in enumerate(selected):
+                self.add_shape_animation(
+                    slide,
+                    shape,
+                    effects[order % len(effects)],
+                    trigger="click" if order == 0 and self.profile.level != "L2" else "with",
+                    delay_ms=order * self.profile.animation.stagger_ms,
+                )
+        return {
+            "mode": "dynamic",
+            "motion_intensity": rule.motion_intensity,
+            "transitions": len(self._transition_by_slide),
+            "animated_slides": len(self._animation_steps),
+        }
+
+    def _new_slide(self):
+        self._slide_number += 1
+        return self.presentation.slides.add_slide(self.presentation.slide_layouts[6])
+
+    def _record(
+        self,
+        slide,
+        layout: str,
+        content_type: str,
+        components: Sequence[str],
+    ) -> None:
+        self.slide_audit.append(
+            {
+                "index": self._slide_number,
+                "layout": layout,
+                "content_type": content_type,
+                "components": list(components),
+                "style_branch": self.style_branch.key if self.style_branch else None,
+                "grid_columns": self.profile.grid.columns,
+                "design_principle": self.profile.design_gene.design_principle,
+                "composition_signature": self.profile.design_gene.composition_signature,
+            }
+        )
+        _ = slide
+
+    def _assert_layout(self, layout: str) -> None:
+        if layout in self.profile.layout.forbidden_layouts:
+            raise ValueError(f"{self.profile.level} forbids layout {layout!r}")
+        if layout not in self.profile.layout.allowed_layouts:
+            raise ValueError(
+                f"{self.profile.level} does not allow layout {layout!r}; "
+                f"allowed={list(self.profile.layout.allowed_layouts)}"
+            )
+
+    def _assert_component(self, component: str) -> None:
+        if component in self.profile.components.forbidden_components:
+            raise ValueError(f"{self.profile.level} forbids component {component!r}")
+        if component not in self.profile.components.allowed_components:
+            raise ValueError(
+                f"{self.profile.level} does not allow component {component!r}; "
+                f"allowed={list(self.profile.components.allowed_components)}"
+            )
+
+    def _background(self, slide) -> None:
+        slide.background.fill.solid()
+        slide.background.fill.fore_color.rgb = rgb(self.profile.palette["background"])
+
+    def _grid_x(self, start_column: int, span: int) -> tuple[float, float]:
+        grid = self.profile.grid
+        step = grid.column_width_in + grid.gutter_in
+        x = grid.margin_left_in + start_column * step
+        width = span * grid.column_width_in + (span - 1) * grid.gutter_in
+        return x, width
+
+    def _weight_bold(self, role: str, explicit: bool | None) -> bool:
+        if explicit is not None:
+            return explicit
+        for item in self.profile.font.levels:
+            if item.key == role:
+                return item.weight in {"semibold", "bold"}
+        return role == "title"
+
+    def _text(
+        self,
+        slide,
+        value: str,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        *,
+        role: str = "body",
+        color: str | None = None,
+        bold: bool | None = None,
+        align=PP_ALIGN.LEFT,
+        valign=MSO_ANCHOR.TOP,
+        font_size: float | None = None,
+        font_family: str | None = None,
+        line_spacing: float | None = None,
+    ):
+        family = font_family or self.fonts.get(role, self.fonts["body"])
+        light_text_roles = {"title", "lead", "module", "section", "body"}
+        color_value = color or self.profile.palette[
+            "text" if role in light_text_roles else "secondary"
+        ]
+        shape = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+        frame = shape.text_frame
+        frame.clear()
+        frame.word_wrap = True
+        frame.vertical_anchor = valign
+        frame.margin_left = frame.margin_right = Inches(0.02)
+        frame.margin_top = frame.margin_bottom = Inches(0.01)
+        paragraphs = value.split("\n")
+        for index, paragraph_text in enumerate(paragraphs):
+            paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
+            paragraph.alignment = align
+            paragraph.line_spacing = (
+                line_spacing
+                if line_spacing is not None
+                else self.profile.font.line_spacing_for(role)
+            )
+            run = paragraph.add_run()
+            run.text = paragraph_text
+            set_cjk_font(run, family)
+            run.font.size = Pt(
+                font_size
+                if font_size is not None
+                else self.profile.font.size_for(role)
+            )
+            run.font.bold = self._weight_bold(role, bold)
+            run.font.color.rgb = rgb(color_value)
+        return shape
+
+    def _apply_shadow(self, shape) -> None:
+        policy = self.profile.grid.shadow_policy
+        shape.shadow.inherit = False
+        if policy == "none":
+            return
+        sp_pr = shape._element.spPr
+        effect_list = sp_pr.find(qn("a:effectLst"))
+        if effect_list is None:
+            effect_list = sp_pr.makeelement(qn("a:effectLst"), {})
+            sp_pr.append(effect_list)
+        shadow = effect_list.makeelement(
+            qn("a:outerShdw"),
+            {
+                "blurRad": str(int(self.profile.grid.shadow_blur_pt * 12700)),
+                "dist": "19050",
+                "dir": "5400000",
+                "algn": "ctr",
+                "rotWithShape": "0",
+            },
+        )
+        color = shadow.makeelement(
+            qn("a:srgbClr"),
+            {"val": self.profile.palette.get("contrast", "#000000").lstrip("#")},
+        )
+        alpha = color.makeelement(
+            qn("a:alpha"),
+            {"val": str(int(self.profile.grid.shadow_opacity * 100000))},
+        )
+        color.append(alpha)
+        shadow.append(color)
+        effect_list.append(shadow)
+
+    def _shape(
+        self,
+        slide,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        fill: str,
+        *,
+        rounded: bool | None = None,
+        line: str | None = None,
+        opacity: float = 1.0,
+        geometry: MSO_SHAPE | None = None,
+    ):
+        use_round = self.profile.layout.allow_rounded_cards if rounded is None else rounded
+        if geometry is None:
+            geometry = MSO_SHAPE.ROUNDED_RECTANGLE if use_round else MSO_SHAPE.RECTANGLE
+        shape = slide.shapes.add_shape(
+            geometry, Inches(x), Inches(y), Inches(w), Inches(h)
+        )
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = rgb(fill)
+        if opacity < 1.0:
+            set_fill_alpha(shape, opacity)
+        if line:
+            shape.line.color.rgb = rgb(line)
+            shape.line.width = Pt(0.8)
+        else:
+            shape.line.fill.background()
+        self._apply_shadow(shape)
+        return shape
+
+    def _line(self, slide, x1, y1, x2, y2, color=None, width=1.0):
+        connector = slide.shapes.add_connector(
+            1, Inches(x1), Inches(y1), Inches(x2), Inches(y2)
+        )
+        connector.line.color.rgb = rgb(color or self.profile.palette["line"])
+        connector.line.width = Pt(width)
+        return connector
+
+    def _image(self, slide, image_path, x, y, w, h):
+        image_path = Path(image_path) if image_path else None
+        if not image_path or not image_path.is_file():
+            return None
+        with Image.open(image_path) as im:
+            source_ratio = im.width / im.height
+        target_ratio = w / h
+        picture = slide.shapes.add_picture(
+            str(image_path), Inches(x), Inches(y), Inches(w), Inches(h)
+        )
+        if self.profile.images.default_fit == "cover":
+            if source_ratio > target_ratio:
+                crop = max(0.0, 1.0 - target_ratio / source_ratio) / 2
+                picture.crop_left = crop
+                picture.crop_right = crop
+            else:
+                crop = max(0.0, 1.0 - source_ratio / target_ratio) / 2
+                picture.crop_top = crop
+                picture.crop_bottom = crop
+        else:
+            if source_ratio > target_ratio:
+                draw_w, draw_h = w, w / source_ratio
+            else:
+                draw_h, draw_w = h, h * source_ratio
+            picture.left = Inches(x + (w - draw_w) / 2)
+            picture.top = Inches(y + (h - draw_h) / 2)
+            picture.width = Inches(draw_w)
+            picture.height = Inches(draw_h)
+        return picture
+
+    def _page_number(self, slide, color: str | None = None) -> None:
+        color = color or self.profile.palette["secondary"]
+        self._text(
+            slide,
+            f"{self._slide_number:02d}",
+            12.18,
+            7.08,
+            0.55,
+            0.22,
+            role="caption",
+            color=color,
+            align=PP_ALIGN.RIGHT,
+            font_family=self.fonts["numeric"],
+        )
+
+    def _footer(self, slide, label: str = "") -> None:
+        if not label:
+            return
+        self._text(
+            slide,
+            label,
+            self.profile.grid.margin_left_in,
+            7.08,
+            6.4 if self.profile.level == "L4" else 10.8,
+            0.24,
+            role="caption",
+            color=self.profile.palette["secondary"],
+        )
+
+    def _budgeted_points(self, points: Sequence[str]) -> list[str]:
+        values = [str(point).strip() for point in points if str(point).strip()]
+        maximum = self.profile.information.max_bullets
+        if maximum is not None and len(values) > maximum:
+            raise ValueError(
+                f"{self.profile.level} allows at most {maximum} points, got {len(values)}"
+            )
+        budget = self.profile.information.max_body_chars
+        total = sum(len(value) for value in values)
+        if budget is not None and total > budget:
+            raise ValueError(
+                f"{self.profile.level} allows at most {budget} body characters, got {total}"
+            )
+        return values
+
+    def _heading(
+        self,
+        slide,
+        title: str,
+        *,
+        eyebrow: str = "",
+        x: float | None = None,
+        y: float = 0.5,
+        w: float = 11.8,
+    ) -> None:
+        left = self.profile.grid.margin_left_in if x is None else x
+        if eyebrow:
+            self._text(
+                slide,
+                eyebrow,
+                left,
+                y,
+                7.0,
+                0.28,
+                role="caption",
+                color=self.profile.palette["accent"],
+                bold=True,
+            )
+            title_y = y + 0.38
+        else:
+            title_y = y
+        self._text(slide, title, left, title_y, w, 0.78, role="title")
+        if self.profile.level != "L1":
+            self._line(
+                slide,
+                left,
+                title_y + 0.9,
+                left + w,
+                title_y + 0.9,
+                self.profile.palette["line"],
+                0.75,
+            )
+
+    def _cover_extra(self, slide, kicker: str, title: str, subtitle: str) -> None:
+        branch = self.style_branch.key if self.style_branch else None
+        accent = self.profile.palette["accent"]
+        if branch == "luxury_brand":
+            self._shape(slide, 8.65, 0.55, 4.1, 6.4, self.profile.palette["surface"])
+            self._shape(slide, 9.05, 0.95, 3.3, 5.6, accent, opacity=0.18)
+        elif branch == "cultural_creative":
+            self._shape(slide, 0, 0, 0.34, SLIDE_H, accent)
+            self._shape(slide, 10.35, 0.7, 2.25, 2.25, accent, opacity=0.22)
+            self._shape(slide, 9.65, 5.35, 2.95, 0.55, self.profile.palette["surface"])
+        elif branch == "product_roadshow":
+            self._shape(slide, 8.55, 0, 4.783, SLIDE_H, accent)
+            self._shape(slide, 8.55, 5.75, 4.783, 1.75, self.profile.palette["contrast"])
+        elif branch in {"technology_launch", None} and self.profile.level == "L4":
+            for index in range(4):
+                self._line(slide, 8.0, 1.1 + index * 1.2, 12.7, 1.1 + index * 1.2, accent, 0.7)
+        elif self.profile.level == "L3":
+            self._shape(slide, 8.9, 0, 4.433, SLIDE_H, self.profile.palette["contrast"])
+            for index in range(4):
+                self._line(
+                    slide,
+                    9.25,
+                    1.15 + index * 1.25,
+                    12.85,
+                    1.15 + index * 1.25,
+                    accent,
+                    0.8,
+                )
+                self._text(
+                    slide,
+                    f"{index + 1:02d}",
+                    9.24,
+                    0.82 + index * 1.25,
+                    0.45,
+                    0.25,
+                    role="caption",
+                    color=accent,
+                    font_family=self.fonts["numeric"],
+                )
+
+    def add_cover(
+        self,
+        title: str,
+        subtitle: str,
+        *,
+        kicker: str = "",
+        image_path: str | Path | None = None,
+    ):
+        slide = self._new_slide()
+        self._background(slide)
+        layout = self.profile.layout.cover_layout
+        self._assert_layout(layout)
+        accent = self.profile.palette["accent"]
+
+        if image_path and self.profile.layout.allow_background_image:
+            self._image(slide, image_path, 0, 0, SLIDE_W, SLIDE_H)
+            mask_color = (
+                self.profile.palette["background"]
+                if not _is_dark(self.profile.palette["background"])
+                else self.profile.palette["contrast"]
+            )
+            self._shape(
+                slide,
+                0,
+                0,
+                SLIDE_W,
+                SLIDE_H,
+                mask_color,
+                rounded=False,
+                opacity=0.62 if self.profile.level == "L3" else 0.5,
+            )
+
+        if layout == "title_body":
+            self._text(slide, title, 0.75, 1.0, 11.5, 1.2, role="title")
+            self._text(slide, subtitle, 0.78, 2.55, 10.8, 0.75, role="body")
+        elif layout == "title_band":
+            self._shape(slide, 0, 0, SLIDE_W, 1.05, accent, rounded=False)
+            self._text(
+                slide,
+                kicker or "BUSINESS PRESENTATION",
+                0.7,
+                0.33,
+                7.5,
+                0.3,
+                role="caption",
+                color=self.profile.palette["background"],
+                bold=True,
+            )
+            self._text(slide, title, 0.72, 1.65, 10.6, 1.2, role="title")
+            self._text(slide, subtitle, 0.74, 3.08, 9.6, 0.78, role="body")
+        elif layout == "case_visual":
+            self._cover_extra(slide, kicker, title, subtitle)
+            self._text(
+                slide,
+                kicker or "PROFESSIONAL VISUAL DESIGN",
+                0.82,
+                0.62,
+                6.7,
+                0.3,
+                role="caption",
+                color=accent,
+                bold=True,
+            )
+            self._text(slide, title, 0.78, 1.45, 7.7, 1.8, role="title")
+            self._text(slide, subtitle, 0.82, 3.85, 6.8, 0.95, role="lead")
+        elif layout == "custom_cover":
+            self._cover_extra(slide, kicker, title, subtitle)
+            text_color = self.profile.palette["text"]
+            self._text(
+                slide,
+                kicker or (self.style_branch.name if self.style_branch else "CUSTOM NARRATIVE"),
+                0.78,
+                0.62,
+                7.1,
+                0.3,
+                role="caption",
+                color=accent,
+                bold=True,
+            )
+            self._text(slide, title, 0.76, 1.35, 7.25, 2.15, role="title", color=text_color)
+            self._text(slide, subtitle, 0.8, 4.0, 6.3, 1.05, role="lead")
+        else:
+            self._text(slide, title, 0.75, 1.0, 11.0, 1.2, role="title")
+            self._text(slide, subtitle, 0.78, 2.55, 10.0, 0.8, role="body")
+
+        self._page_number(slide)
+        self._record(slide, layout, "title", ("cover",))
+        return slide
+
+    def add_content(
+        self,
+        title: str,
+        points: Sequence[str],
+        *,
+        content_type: str = "bullets",
+        requested_layout: str = "",
+        eyebrow: str = "",
+        image_path: str | Path | None = None,
+    ):
+        points = self._budgeted_points(points)
+        layout = resolve_layout(
+            self.profile.level,
+            requested_layout,
+            content_type=content_type,
+            has_image=bool(image_path),
+            has_data=content_type in {"data", "metrics", "table", "chart"},
+        )
+        self._assert_layout(layout)
+        # Structured data pages are generated by add_data_dashboard(), where the
+        # caller supplies real values. A text-only call must not invent a chart.
+        if layout == "data_dashboard":
+            fallback = next(
+                (
+                    candidate
+                    for candidate in ("key_conclusion", "image_text_split", "action_summary")
+                    if candidate in self.profile.layout.allowed_layouts
+                ),
+                self.profile.layout.content_layout,
+            )
+            if fallback != layout:
+                return self.add_content(
+                    title,
+                    points,
+                    content_type="narrative",
+                    requested_layout=fallback,
+                    eyebrow=eyebrow,
+                    image_path=image_path,
+                )
+        if layout == "metric_cards":
+            metrics = [
+                (f"Point {index + 1}", point, "")
+                for index, point in enumerate(points[:4])
+            ]
+            return self.add_metric_cards(
+                title,
+                metrics=metrics,
+                insight="",
+                eyebrow=eyebrow,
+            )
+        slide = self._new_slide()
+        self._background(slide)
+        accent = self.profile.palette["accent"]
+        line = self.profile.palette["line"]
+
+        if layout == "title_body":
+            self._heading(slide, title, eyebrow=eyebrow, y=0.7, w=11.8)
+            body = "\n".join(f"• {point}" for point in points)
+            self._text(
+                slide,
+                body,
+                0.74,
+                1.9,
+                9.0 if image_path else 11.7,
+                4.8,
+                role="body",
+            )
+            if image_path:
+                self._image(slide, image_path, 10.05, 1.75, 2.55, 4.8)
+        elif layout == "simple_split":
+            self._heading(slide, title, eyebrow=eyebrow, y=0.62)
+            split = max(1, (len(points) + 1) // 2)
+            for column, group in enumerate((points[:split], points[split:])):
+                x = 0.72 + column * 6.25
+                body = "\n".join(f"• {point}" for point in group)
+                self._text(slide, body, x, 2.0, 5.6, 4.55, role="body")
+                if column == 0 and len(group) > 0:
+                    self._line(slide, 6.48, 2.0, 6.48, 6.35, line)
+        elif layout in {"symmetric_columns", "structured_title_bar"}:
+            self._shape(slide, 0, 0, SLIDE_W, 0.95, accent, rounded=False)
+            self._text(
+                slide,
+                title,
+                0.7,
+                0.18,
+                11.7,
+                0.6,
+                role="title",
+                color=self.profile.palette["background"],
+            )
+            groups = [points] if image_path else (
+                [points[: max(1, (len(points) + 1) // 2)], points[max(1, (len(points) + 1) // 2) :]]
+            )
+            for column, group in enumerate(groups):
+                x = 0.72 + column * 6.05
+                for index, point in enumerate(group):
+                    y = 1.45 + index * 0.72
+                    self._text(
+                        slide,
+                        f"{index + 1:02d}",
+                        x,
+                        y,
+                        0.42,
+                        0.3,
+                        role="caption",
+                        color=accent,
+                        font_family=self.fonts["numeric"],
+                    )
+                    self._text(
+                        slide,
+                        point,
+                        x + 0.48,
+                        y - 0.04,
+                        5.0 if image_path else 4.9,
+                        0.58,
+                        role="body",
+                    )
+            if image_path:
+                image_x, image_w = self._grid_x(9, 3)
+                self._image(slide, image_path, image_x, 1.35, image_w, 4.9)
+        elif layout == "structured_cards":
+            self._heading(slide, title, eyebrow=eyebrow)
+            self._assert_component("basic_card")
+            count = min(max(len(points), 1), self.profile.components.max_cards_per_slide)
+            gap = 0.24
+            width = (11.9 - gap * (count - 1)) / count
+            for index, point in enumerate(points[:count]):
+                x = 0.72 + index * (width + gap)
+                self._shape(
+                    slide,
+                    x,
+                    2.0,
+                    width,
+                    3.75,
+                    self.profile.palette["surface"],
+                    rounded=False,
+                    line=line,
+                )
+                self._shape(slide, x, 2.0, width, 0.08, accent, rounded=False)
+                self._text(
+                    slide,
+                    f"{index + 1:02d}",
+                    x + 0.22,
+                    2.32,
+                    0.55,
+                    0.28,
+                    role="caption",
+                    color=accent,
+                    font_family=self.fonts["numeric"],
+                )
+                self._text(slide, point, x + 0.22, 2.88, width - 0.44, 2.25, role="body")
+        elif layout == "framed_image_text":
+            self._heading(slide, title, eyebrow=eyebrow)
+            body = "\n\n".join(f"{index + 1:02d}  {point}" for index, point in enumerate(points[:4]))
+            self._text(slide, body, 0.75, 2.0, 6.4, 4.3, role="body")
+            frame_x, frame_w = 7.45, 5.15
+            self._shape(slide, frame_x, 1.72, frame_w, 4.85, self.profile.palette["surface"])
+            if image_path:
+                self._image(slide, image_path, frame_x + 0.16, 1.88, frame_w - 0.32, 4.53)
+        elif layout == "key_conclusion":
+            self._heading(slide, title, eyebrow=eyebrow, w=11.7)
+            self._shape(slide, 0.72, 1.95, 0.1, 3.85, accent, rounded=False)
+            statement = points[0] if points else ""
+            self._text(slide, statement, 1.05, 2.15, 7.25, 1.4, role="title")
+            evidence = points[1:4]
+            for index, point in enumerate(evidence):
+                y = 4.0 + index * 0.72
+                self._text(
+                    slide,
+                    f"{index + 1:02d}",
+                    8.72,
+                    y,
+                    0.42,
+                    0.28,
+                    role="caption",
+                    color=accent,
+                    font_family=self.fonts["numeric"],
+                )
+                self._text(slide, point, 9.18, y - 0.04, 3.3, 0.55, role="body")
+            if image_path:
+                self._image(slide, image_path, 9.0, 1.9, 3.45, 1.65)
+        elif layout == "image_text_split":
+            self._heading(slide, title, eyebrow=eyebrow)
+            body = "\n\n".join(points[:4])
+            self._text(slide, body, 0.75, 2.02, 5.65, 4.25, role="body")
+            frame_x, frame_w = 6.75, 5.85
+            self._shape(
+                slide,
+                frame_x,
+                1.62,
+                frame_w,
+                4.75,
+                self.profile.palette["surface"],
+                rounded=True,
+                line=line,
+            )
+            if image_path:
+                self._image(slide, image_path, frame_x + 0.18, 1.8, frame_w - 0.36, 4.4)
+            else:
+                self._text(
+                    slide,
+                    f"{self.profile.strategy.key.upper()}\nVISUAL EVIDENCE",
+                    frame_x + 0.55,
+                    2.8,
+                    frame_w - 1.1,
+                    1.6,
+                    role="module",
+                    color=accent,
+                    align=PP_ALIGN.CENTER,
+                )
+        elif layout == "architecture_compare":
+            self._heading(slide, title, eyebrow=eyebrow)
+            half = max(1, (len(points) + 1) // 2)
+            groups = (points[:half], points[half:])
+            for column, group in enumerate(groups):
+                x = 0.75 + column * 6.08
+                self._text(
+                    slide,
+                    "CURRENT" if column == 0 else "TARGET",
+                    x,
+                    1.88,
+                    2.0,
+                    0.3,
+                    role="caption",
+                    color=accent if column == 1 else self.profile.palette["secondary"],
+                    font_family=self.fonts["numeric"],
+                    bold=True,
+                )
+                for index, point in enumerate(group):
+                    y = 2.38 + index * 0.82
+                    self._shape(
+                        slide,
+                        x,
+                        y,
+                        5.35,
+                        0.62,
+                        self.profile.palette["surface"],
+                        rounded=True,
+                        line=line,
+                    )
+                    self._text(slide, point, x + 0.2, y + 0.12, 4.95, 0.38, role="body")
+            self._line(slide, 6.42, 2.0, 6.42, 5.45, accent, 1.2)
+        elif layout == "data_dashboard":
+            return self.add_data_dashboard(
+                title,
+                metrics=[],
+                categories=["A", "B", "C"],
+                series=[("Value", [1, 2, 3])],
+                insight=points[0] if points else "",
+                eyebrow=eyebrow,
+            )
+        elif layout == "metric_cards":
+            metrics = [
+                (f"Point {index + 1}", point, "")
+                for index, point in enumerate(points[:4])
+            ]
+            return self.add_metric_cards(
+                title,
+                metrics=metrics,
+                insight="",
+                eyebrow=eyebrow,
+            )
+        elif layout == "standard_table":
+            self._heading(slide, title, eyebrow=eyebrow)
+            rows = [
+                ("Item", point, "Source text")
+                for point in points[:5]
+            ]
+            self._add_table(
+                slide,
+                ["字段", "内容", "说明"],
+                rows,
+                0.72,
+                1.95,
+                11.85,
+                4.25,
+            )
+        elif layout == "editorial_collage":
+            self._heading(slide, title, eyebrow=eyebrow, w=6.8)
+            if image_path:
+                self._image(slide, image_path, 7.75, 0, 5.583, SLIDE_H)
+                self._shape(
+                    slide,
+                    7.55,
+                    0,
+                    0.06,
+                    SLIDE_H,
+                    self.profile.palette["accent"],
+                    rounded=False,
+                )
+            else:
+                self._shape(slide, 7.75, 0, 5.583, SLIDE_H, self.profile.palette["surface"])
+            for index, point in enumerate(points[:3]):
+                y = 1.95 + index * 1.18
+                self._text(
+                    slide,
+                    f"{index + 1:02d}",
+                    0.72,
+                    y,
+                    0.45,
+                    0.28,
+                    role="caption",
+                    color=accent,
+                    font_family=self.fonts["numeric"],
+                )
+                self._text(slide, point, 1.3, y - 0.05, 5.65, 0.78, role="body")
+        elif layout == "custom_infographic":
+            self._heading(slide, title, eyebrow=eyebrow)
+            count = max(1, min(len(points), 4))
+            gap = self.profile.grid.gutter_in
+            total = 13.333 - self.profile.grid.margin_left_in - self.profile.grid.margin_right_in
+            width = (total - gap * (count - 1)) / count
+            for index, point in enumerate(points[:count]):
+                x = self.profile.grid.margin_left_in + index * (width + gap)
+                self._shape(
+                    slide,
+                    x,
+                    2.05,
+                    width,
+                    3.7,
+                    self.profile.palette["surface"],
+                    rounded=True,
+                    line=self.profile.palette["line"],
+                )
+                self._shape(
+                    slide,
+                    x,
+                    2.05,
+                    width,
+                    0.1,
+                    self.profile.palette["accent"],
+                    rounded=False,
+                )
+                self._text(
+                    slide,
+                    f"{index + 1:02d}",
+                    x + 0.22,
+                    2.4,
+                    0.72,
+                    0.82,
+                    role="title",
+                    color=self.profile.palette["accent"],
+                    font_family=self.fonts["numeric"],
+                )
+                self._text(slide, point, x + 0.22, 3.2, width - 0.44, 1.8, role="body")
+        elif layout == "full_bleed_story":
+            if image_path:
+                self._image(slide, image_path, 0, 0, SLIDE_W, SLIDE_H)
+                self._shape(
+                    slide,
+                    0,
+                    0,
+                    SLIDE_W,
+                    SLIDE_H,
+                    self.profile.palette["contrast"],
+                    rounded=False,
+                    opacity=0.52,
+                )
+            self._text(
+                slide,
+                title,
+                0.72,
+                1.25,
+                8.6,
+                1.3,
+                role="title",
+                color="#FFFFFF" if image_path else None,
+            )
+            self._text(
+                slide,
+                "\n".join(points[:2]),
+                0.76,
+                3.0,
+                7.2,
+                1.4,
+                role="lead",
+                color="#E8F2F3" if image_path else None,
+            )
+        elif layout == "asymmetric_narrative":
+            self._heading(slide, title, eyebrow=eyebrow, w=8.0)
+            body = "\n\n".join(points[:4])
+            self._text(slide, body, 0.74, 2.0, 6.45, 4.3, role="body")
+            self._shape(
+                slide,
+                7.6,
+                1.55,
+                5.0,
+                4.85,
+                self.profile.palette["surface"],
+                rounded=True,
+                line=self.profile.palette["line"],
+            )
+            if image_path:
+                self._image(slide, image_path, 7.78, 1.73, 4.64, 4.49)
+            else:
+                self._text(
+                    slide,
+                    self.style_branch.name if self.style_branch else "NARRATIVE",
+                    8.2,
+                    3.2,
+                    3.8,
+                    0.8,
+                    role="module",
+                    color=accent,
+                    align=PP_ALIGN.CENTER,
+                )
+        else:
+            self._heading(slide, title, eyebrow=eyebrow)
+            body = "\n\n".join(points)
+            self._text(slide, body, 0.75, 2.0, 11.55, 4.2, role="body")
+
+        self._page_number(slide)
+        self._footer(slide, self.profile.strategy.key if self.profile.strategy else "")
+        self._record(slide, layout, content_type, (layout,))
+        return slide
+
+    def add_section(
+        self,
+        title: str,
+        subtitle: str = "",
+        *,
+        image_path: str | Path | None = None,
+    ):
+        layout = resolve_layout(
+            self.profile.level,
+            content_type="section",
+            has_image=bool(image_path),
+        )
+        self._assert_layout(layout)
+        slide = self._new_slide()
+        self._background(slide)
+        accent = self.profile.palette["accent"]
+
+        if layout == "simple_split":
+            self._text(slide, f"{self._slide_number:02d}", 0.75, 0.75, 1.0, 0.5, role="title")
+            self._text(slide, title, 0.75, 1.55, 6.1, 1.0, role="title")
+            if subtitle:
+                self._text(slide, subtitle, 6.7, 1.9, 5.2, 1.2, role="body")
+        elif layout == "numbered_section":
+            self._shape(slide, 0, 0, 4.4, SLIDE_H, accent, rounded=False)
+            self._text(
+                slide,
+                f"{self._slide_number:02d}",
+                0.65,
+                0.72,
+                2.2,
+                1.0,
+                role="title",
+                color=self.profile.palette["background"],
+                font_family=self.fonts["numeric"],
+            )
+            self._text(slide, title, 5.0, 1.55, 7.2, 1.0, role="title")
+            if subtitle:
+                self._text(slide, subtitle, 5.02, 2.9, 6.7, 0.85, role="body")
+        elif layout == "section_transition":
+            self._shape(slide, 0, 0, 0.16, SLIDE_H, accent, rounded=False)
+            self._text(
+                slide,
+                f"{self._slide_number:02d}",
+                0.85,
+                0.65,
+                1.6,
+                0.65,
+                role="title",
+                color=accent,
+                font_family=self.fonts["numeric"],
+            )
+            self._text(slide, title, 0.82, 2.05, 8.0, 1.2, role="title")
+            if subtitle:
+                self._text(slide, subtitle, 0.85, 3.55, 6.4, 0.95, role="lead")
+            if image_path:
+                self._image(slide, image_path, 8.35, 0, 4.983, SLIDE_H)
+        elif layout == "immersive_section":
+            on_image = bool(image_path)
+            if image_path:
+                self._image(slide, image_path, 0, 0, SLIDE_W, SLIDE_H)
+                self._shape(
+                    slide,
+                    0,
+                    0,
+                    SLIDE_W,
+                    SLIDE_H,
+                    self.profile.palette["contrast"],
+                    rounded=False,
+                    opacity=0.58,
+                )
+            self._text(
+                slide,
+                f"{self._slide_number:02d}",
+                0.7,
+                0.55,
+                2.0,
+                1.0,
+                role="title",
+                color=accent,
+                font_family=self.fonts["numeric"],
+            )
+            self._text(
+                slide,
+                title,
+                0.72,
+                2.25,
+                8.4,
+                1.3,
+                role="title",
+                color="#FFFFFF" if on_image else None,
+            )
+            if subtitle:
+                self._text(
+                    slide,
+                    subtitle,
+                    0.76,
+                    3.9,
+                    7.1,
+                    0.95,
+                    role="lead",
+                    color="#E8F2F3" if on_image else None,
+                )
+        else:
+            self._text(slide, title, 0.75, 1.2, 10.8, 1.1, role="title")
+            if subtitle:
+                self._text(slide, subtitle, 0.78, 2.55, 9.0, 0.85, role="body")
+        self._page_number(slide, color="#FFFFFF" if layout == "immersive_section" and image_path else None)
+        self._record(slide, layout, "section", (layout,))
+        return slide
+
+    def _style_chart(self, chart) -> None:
+        normalize_chart_axis_ids(chart)
+        chart.has_title = False
+        chart.has_legend = self.profile.charts.show_legend
+        if chart.has_legend:
+            chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+            chart.legend.include_in_layout = False
+        chart.value_axis.has_major_gridlines = self.profile.charts.show_gridlines
+        chart.plots[0].has_data_labels = self.profile.charts.show_data_labels
+        if self.profile.charts.axis_zero_based:
+            chart.value_axis.minimum_scale = 0
+        chart.font.name = self.fonts["body"]
+        chart.font.size = Pt(self.profile.font.size_for("caption"))
+        chart.font.color.rgb = rgb(self.profile.palette["text"])
+        for axis in (chart.category_axis, chart.value_axis):
+            axis.tick_labels.font.name = self.fonts["numeric"]
+            axis.tick_labels.font.size = Pt(self.profile.font.size_for("caption"))
+            axis.tick_labels.font.color.rgb = rgb(self.profile.palette["secondary"])
+            axis.format.line.color.rgb = rgb(self.profile.palette["line"])
+        colors = [
+            self.profile.palette["accent"],
+            self.profile.palette["secondary"],
+            self.profile.palette["line"],
+            self.profile.palette["text"],
+        ]
+        for index, chart_series in enumerate(chart.series):
+            chart_series.format.fill.solid()
+            chart_series.format.fill.fore_color.rgb = rgb(colors[index % len(colors)])
+
+    def _add_chart(
+        self,
+        slide,
+        categories,
+        series,
+        x,
+        y,
+        w,
+        h,
+        *,
+        chart_hint=None,
+    ):
+        preferred = self.profile.charts.preferred_types
+        chart_kind = chart_hint if chart_hint in preferred else preferred[0]
+        chart_type = {
+            "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
+            "bar": XL_CHART_TYPE.BAR_CLUSTERED,
+            "line": XL_CHART_TYPE.LINE_MARKERS,
+            "pie": XL_CHART_TYPE.PIE,
+            "donut": XL_CHART_TYPE.DOUGHNUT,
+            "table": XL_CHART_TYPE.COLUMN_CLUSTERED,
+            "bullet": XL_CHART_TYPE.BAR_CLUSTERED,
+            "illustrated_bar": XL_CHART_TYPE.COLUMN_CLUSTERED,
+            "editorial_line": XL_CHART_TYPE.LINE_MARKERS,
+            "custom_infographic": XL_CHART_TYPE.DOUGHNUT,
+        }.get(chart_kind, XL_CHART_TYPE.COLUMN_CLUSTERED)
+        data = CategoryChartData()
+        data.categories = list(categories)
+        for name, values in list(series)[: self.profile.charts.max_series]:
+            data.add_series(name, values)
+        chart = slide.shapes.add_chart(
+            chart_type, Inches(x), Inches(y), Inches(w), Inches(h), data
+        ).chart
+        self._style_chart(chart)
+        return chart
+
+    def add_chart(
+        self,
+        title: str,
+        categories: Sequence[str],
+        series: Sequence[tuple[str, Sequence[float]]],
+        *,
+        chart_hint: str | None = None,
+    ):
+        layout = resolve_layout(
+            self.profile.level,
+            content_type="data",
+            has_data=True,
+        )
+        if layout not in {
+            "chart_analysis",
+            "data_dashboard",
+            "title_body",
+            "structured_table",
+        }:
+            layout = "chart_analysis" if "chart_analysis" in self.profile.layout.allowed_layouts else layout
+        self._assert_layout(layout)
+        slide = self._new_slide()
+        self._background(slide)
+        self._heading(slide, title, y=0.5, w=11.8)
+        chart_y = 1.65
+        chart_h = 4.9
+        if layout == "title_body":
+            chart_y, chart_h = 1.85, 4.6
+        chart_x = self.profile.grid.margin_left_in
+        chart_w = (
+            13.333
+            - self.profile.grid.margin_left_in
+            - self.profile.grid.margin_right_in
+        )
+        chart = self._add_chart(
+            slide,
+            categories,
+            series,
+            chart_x,
+            chart_y,
+            chart_w,
+            chart_h,
+            chart_hint=chart_hint,
+        )
+        self._page_number(slide)
+        self._footer(slide, self.profile.charts.style_note)
+        self._record(slide, layout, "data", ("standard_chart",))
+        return slide
+
+    def add_metric_cards(
+        self,
+        title: str,
+        metrics: Sequence[tuple[str, str, str]],
+        *,
+        insight: str = "",
+        eyebrow: str = "",
+    ):
+        layout = resolve_layout(
+            self.profile.level,
+            content_type="metrics",
+            has_data=True,
+        )
+        self._assert_layout(layout)
+        if self.profile.level == "L2":
+            self._assert_component("basic_card")
+        else:
+            self._assert_component("metric_card")
+        slide = self._new_slide()
+        self._background(slide)
+        self._heading(slide, title, eyebrow=eyebrow)
+        count = max(1, min(len(metrics), self.profile.components.max_cards_per_slide))
+        gap = self.profile.grid.gutter_in
+        total_width = 13.333 - self.profile.grid.margin_left_in - self.profile.grid.margin_right_in
+        hero = self.profile.level in {"L3", "L4"} and count >= 3
+        if hero:
+            spans = [6, 2, 2, 2][:count]
+            if count == 3:
+                spans = [6, 3, 3]
+            boxes = []
+            column = 0
+            for index, span in enumerate(spans):
+                x, width = self._grid_x(column, span)
+                boxes.append(
+                    (
+                        x,
+                        1.72 if index == 0 else 2.12,
+                        width,
+                        3.72 if index == 0 else 2.92,
+                    )
+                )
+                column += span
+        else:
+            width = (total_width - gap * (count - 1)) / count
+            boxes = [
+                (
+                    self.profile.grid.margin_left_in + index * (width + gap),
+                    1.95,
+                    width,
+                    3.25,
+                )
+                for index in range(count)
+            ]
+        for index, (label, value, note) in enumerate(metrics[:count]):
+            x, card_y, card_w, card_h = boxes[index]
+            rounded = self.profile.layout.allow_rounded_cards
+            self._shape(
+                slide,
+                x,
+                card_y,
+                card_w,
+                card_h,
+                self.profile.palette["surface"],
+                rounded=rounded,
+                line=self.profile.palette["line"],
+            )
+            self._text(
+                slide,
+                label,
+                x + 0.24,
+                card_y + 0.25,
+                card_w - 0.48,
+                0.35,
+                role="caption",
+                color=self.profile.palette["secondary"],
+                bold=True,
+            )
+            value_size = None
+            self._text(
+                slide,
+                value,
+                x + 0.24,
+                card_y + 0.87,
+                card_w - 0.48,
+                0.95 if hero and index == 0 else 0.78,
+                role="title",
+                color=self.profile.palette["accent"],
+                font_family=self.fonts["numeric"],
+                font_size=value_size,
+            )
+            self._text(
+                slide,
+                note,
+                x + 0.24,
+                card_y + card_h - 1.06,
+                card_w - 0.48,
+                0.72,
+                role="body",
+                color=self.profile.palette["secondary"],
+            )
+        if insight:
+            self._text(slide, insight, 0.72, 5.65, 11.75, 0.65, role="body")
+        self._page_number(slide)
+        self._record(slide, layout, "metrics", ("metric_card",))
+        return slide
+
+    def add_data_dashboard(
+        self,
+        title: str,
+        metrics: Sequence[tuple[str, str, str]],
+        categories: Sequence[str],
+        series: Sequence[tuple[str, Sequence[float]]],
+        *,
+        insight: str = "",
+        eyebrow: str = "",
+        chart_hint: str | None = None,
+    ):
+        layout = "data_dashboard"
+        self._assert_layout(layout)
+        self._assert_component("data_dashboard")
+        if metrics:
+            self._assert_component("metric_card")
+        slide = self._new_slide()
+        self._background(slide)
+        self._heading(slide, title, eyebrow=eyebrow)
+        left_x, left_w = self._grid_x(0, 4)
+        for index, (label, value, note) in enumerate(metrics[:3]):
+            y = 1.95 + index * 1.32
+            self._shape(
+                slide,
+                left_x,
+                y,
+                left_w,
+                1.02,
+                self.profile.palette["surface"],
+                rounded=True,
+                line=self.profile.palette["line"],
+            )
+            self._text(slide, label, left_x + 0.18, y + 0.12, 1.45, 0.26, role="caption")
+            self._text(
+                slide,
+                value,
+                left_x + 1.7,
+                y + 0.13,
+                1.55,
+                0.42,
+                role="module",
+                color=self.profile.palette["accent"],
+                font_family=self.fonts["numeric"],
+                align=PP_ALIGN.RIGHT,
+            )
+            self._text(slide, note, left_x + 0.18, y + 0.62, left_w - 0.36, 0.25, role="caption")
+        chart_x, chart_w = self._grid_x(4, 8)
+        self._add_chart(
+            slide,
+            categories,
+            series,
+            chart_x,
+            1.9,
+            chart_w,
+            3.95,
+            chart_hint=chart_hint,
+        )
+        if insight:
+            self._text(slide, insight, chart_x, 5.95, chart_w, 0.5, role="body")
+        self._page_number(slide)
+        self._record(
+            slide,
+            layout,
+            "data",
+            tuple(
+                ["data_dashboard"]
+                + (["metric_card"] if metrics else [])
+                + ["standard_chart"]
+            ),
+        )
+        return slide
+
+    def add_process_steps(
+        self,
+        title: str,
+        steps: Sequence[tuple[str, str]],
+        *,
+        eyebrow: str = "",
+    ):
+        layout = "process_steps"
+        self._assert_layout(layout)
+        self._assert_component("process_step")
+        slide = self._new_slide()
+        self._background(slide)
+        self._heading(slide, title, eyebrow=eyebrow)
+        count = max(1, min(len(steps), 5))
+        gap = 0.18
+        total = (
+            13.333
+            - self.profile.grid.margin_left_in
+            - self.profile.grid.margin_right_in
+        )
+        width = (total - gap * (count - 1)) / count
+        for index, (label, description) in enumerate(steps[:count]):
+            x = self.profile.grid.margin_left_in + index * (width + gap)
+            self._shape(
+                slide,
+                x,
+                2.25,
+                width,
+                2.9,
+                self.profile.palette["surface"],
+                rounded=True,
+                line=self.profile.palette["line"],
+            )
+            self._shape(
+                slide,
+                x + 0.18,
+                2.45,
+                0.58,
+                0.58,
+                self.profile.palette["accent"],
+                rounded=True,
+            )
+            self._text(
+                slide,
+                f"{index + 1:02d}",
+                x + 0.19,
+                2.6,
+                0.56,
+                0.24,
+                role="caption",
+                color=self.profile.palette["surface"],
+                align=PP_ALIGN.CENTER,
+                font_family=self.fonts["numeric"],
+            )
+            self._text(slide, label, x + 0.2, 3.3, width - 0.4, 0.62, role="module")
+            self._text(
+                slide,
+                description,
+                x + 0.2,
+                4.05,
+                width - 0.4,
+                0.85,
+                role="body",
+                color=self.profile.palette["secondary"],
+            )
+            if index < count - 1:
+                self._line(
+                    slide,
+                    x + width,
+                    3.7,
+                    x + width + gap,
+                    3.7,
+                    self.profile.palette["accent"],
+                    1.1,
+                )
+        self._page_number(slide)
+        self._record(slide, layout, "process", ("process_step",))
+        return slide
+
+    def add_timeline(
+        self,
+        title: str,
+        milestones: Sequence[tuple[str, str, str]],
+        *,
+        eyebrow: str = "",
+    ):
+        layout = "timeline" if self.profile.level == "L3" else "narrative_timeline"
+        self._assert_layout(layout)
+        self._assert_component("timeline")
+        slide = self._new_slide()
+        self._background(slide)
+        self._heading(slide, title, eyebrow=eyebrow)
+        self._line(slide, 0.9, 3.55, 12.4, 3.55, self.profile.palette["line"], 1.4)
+        count = max(1, min(len(milestones), 5))
+        for index, (date, label, description) in enumerate(milestones[:count]):
+            x = 1.0 + index * (10.9 / max(count - 1, 1))
+            self._shape(
+                slide,
+                x - 0.12,
+                3.43,
+                0.24,
+                0.24,
+                self.profile.palette["accent"],
+                rounded=True,
+            )
+            self._text(
+                slide,
+                date,
+                x - 0.56,
+                2.95,
+                1.25,
+                0.3,
+                role="caption",
+                color=self.profile.palette["accent"],
+                font_family=self.fonts["numeric"],
+                align=PP_ALIGN.CENTER,
+            )
+            self._text(
+                slide,
+                label,
+                x - 0.8,
+                3.85,
+                1.8,
+                0.55,
+                role="module",
+                align=PP_ALIGN.CENTER,
+            )
+            self._text(
+                slide,
+                description,
+                x - 0.85,
+                4.48,
+                1.95,
+                0.8,
+                role="body",
+                color=self.profile.palette["secondary"],
+                align=PP_ALIGN.CENTER,
+            )
+        self._page_number(slide)
+        self._record(slide, layout, "timeline", ("timeline",))
+        return slide
+
+    def add_icon_text_modules(
+        self,
+        title: str,
+        modules: Sequence[tuple[str, str]],
+        *,
+        eyebrow: str = "",
+    ):
+        self._assert_component("icon_text_module" if self.profile.level == "L3" else "minimal_icon")
+        layout = resolve_layout(
+            self.profile.level,
+            content_type="cards",
+        )
+        if self.profile.level == "L2":
+            layout = "structured_cards"
+        else:
+            layout = "icon_text_modules"
+        self._assert_layout(layout)
+        slide = self._new_slide()
+        self._background(slide)
+        self._heading(slide, title, eyebrow=eyebrow)
+        count = max(1, min(len(modules), self.profile.components.max_cards_per_slide))
+        gap = 0.24
+        width = (11.9 - gap * (count - 1)) / count
+        geometries = (MSO_SHAPE.OVAL, MSO_SHAPE.HEXAGON, MSO_SHAPE.DIAMOND, MSO_SHAPE.ROUNDED_RECTANGLE)
+        for index, (label, description) in enumerate(modules[:count]):
+            x = 0.72 + index * (width + gap)
+            self._shape(
+                slide,
+                x,
+                2.0,
+                width,
+                3.65,
+                self.profile.palette["surface"],
+                rounded=(self.profile.level != "L2"),
+                line=self.profile.palette["line"],
+            )
+            self._shape(
+                slide,
+                x + 0.22,
+                2.28,
+                0.7,
+                0.7,
+                self.profile.palette["accent"],
+                rounded=False,
+                geometry=geometries[index % len(geometries)],
+            )
+            self._text(slide, label, x + 0.22, 3.2, width - 0.44, 0.6, role="module")
+            self._text(
+                slide,
+                description,
+                x + 0.22,
+                3.9,
+                width - 0.44,
+                1.25,
+                role="body",
+                color=self.profile.palette["secondary"],
+            )
+        self._page_number(slide)
+        self._record(
+            slide,
+            layout,
+            "cards",
+            ("icon_text_module",) if self.profile.level != "L2" else ("basic_card", "minimal_icon"),
+        )
+        return slide
+
+    def add_architecture_compare(
+        self,
+        title: str,
+        left_title: str,
+        left_items: Sequence[str],
+        right_title: str,
+        right_items: Sequence[str],
+        *,
+        eyebrow: str = "",
+    ):
+        layout = "architecture_compare"
+        self._assert_layout(layout)
+        self._assert_component("architecture_compare")
+        slide = self._new_slide()
+        self._background(slide)
+        self._heading(slide, title, eyebrow=eyebrow)
+        for column, (label, items) in enumerate(
+            ((left_title, left_items), (right_title, right_items))
+        ):
+            x = 0.72 + column * 6.05
+            self._text(slide, label, x, 1.9, 5.2, 0.42, role="module")
+            for index, item in enumerate(items[:5]):
+                y = 2.48 + index * 0.72
+                self._shape(
+                    slide,
+                    x,
+                    y,
+                    5.2,
+                    0.52,
+                    self.profile.palette["surface"],
+                    rounded=True,
+                    line=self.profile.palette["line"],
+                )
+                self._text(slide, item, x + 0.18, y + 0.1, 4.84, 0.3, role="body")
+        self._line(
+            slide,
+            6.38,
+            1.95,
+            6.38,
+            5.55,
+            self.profile.palette["accent"],
+            1.2,
+        )
+        self._page_number(slide)
+        self._record(slide, layout, "architecture", ("architecture_compare",))
+        return slide
+
+    def add_case_study(
+        self,
+        title: str,
+        challenge: str,
+        action: str,
+        result: str,
+        *,
+        eyebrow: str = "",
+        image_path: str | Path | None = None,
+    ):
+        layout = resolve_layout(
+            self.profile.level,
+            content_type="case",
+            has_image=bool(image_path),
+        )
+        self._assert_layout(layout)
+        if self.profile.level != "L1":
+            self._assert_component("case_visual")
+        slide = self._new_slide()
+        self._background(slide)
+        self._heading(slide, title, eyebrow=eyebrow)
+        items = (("挑战", challenge), ("行动", action), ("结果", result))
+        for index, (label, value) in enumerate(items):
+            y = 1.85 + index * 1.32
+            self._text(
+                slide,
+                f"{index + 1:02d}",
+                0.72,
+                y + 0.12,
+                0.45,
+                0.28,
+                role="caption",
+                color=self.profile.palette["accent"],
+                font_family=self.fonts["numeric"],
+            )
+            self._text(slide, label, 1.28, y, 1.1, 0.35, role="caption", bold=True)
+            self._text(slide, value, 2.3, y - 0.05, 4.9, 0.9, role="body")
+        if image_path:
+            self._image(slide, image_path, 7.55, 1.55, 5.0, 4.9)
+        else:
+            self._shape(
+                slide,
+                7.55,
+                1.55,
+                5.0,
+                4.9,
+                self.profile.palette["surface"],
+                rounded=self.profile.layout.allow_rounded_cards,
+                line=self.profile.palette["line"],
+            )
+            self._text(
+                slide,
+                "CASE EVIDENCE",
+                8.25,
+                3.25,
+                3.6,
+                0.8,
+                role="module",
+                color=self.profile.palette["accent"],
+                align=PP_ALIGN.CENTER,
+            )
+        self._page_number(slide)
+        self._record(slide, layout, "case", ("case_visual",))
+        return slide
+
+    def _add_table(self, slide, headers, rows, x, y, w, h):
+        shape = slide.shapes.add_table(
+            len(rows) + 1,
+            len(headers),
+            Inches(x),
+            Inches(y),
+            Inches(w),
+            Inches(h),
+        )
+        table = shape.table
+        column_w = w / len(headers)
+        for column in range(len(headers)):
+            table.columns[column].width = Inches(column_w)
+        for row_index in range(len(rows) + 1):
+            table.rows[row_index].height = Inches(h / (len(rows) + 1))
+        for column, header in enumerate(headers):
+            self._set_cell(table.cell(0, column), header, header=True)
+        for row_index, row in enumerate(rows, 1):
+            for column, value in enumerate(row):
+                self._set_cell(table.cell(row_index, column), str(value))
+        return table
+
+    def _set_cell(self, cell, value, *, header=False):
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = rgb(
+            self.profile.palette["accent"]
+            if header
+            else self.profile.palette["surface"]
+        )
+        cell.margin_left = cell.margin_right = Inches(0.12)
+        cell.margin_top = cell.margin_bottom = Inches(0.05)
+        frame = cell.text_frame
+        frame.clear()
+        frame.word_wrap = True
+        frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+        paragraph = frame.paragraphs[0]
+        run = paragraph.add_run()
+        run.text = value
+        set_cjk_font(run, self.fonts["body"])
+        run.font.size = Pt(self.profile.font.size_for("caption") + 1)
+        run.font.bold = header
+        run.font.color.rgb = rgb(
+            self.profile.palette["background"]
+            if header
+            else self.profile.palette["text"]
+        )
+
+    def add_product_roadshow(
+        self,
+        title: str,
+        claim: str,
+        proof_points: Sequence[str],
+        *,
+        image_path: str | Path | None = None,
+    ):
+        layout = "product_roadshow"
+        self._assert_layout(layout)
+        self._assert_component("case_visual")
+        slide = self._new_slide()
+        self._background(slide)
+        if image_path:
+            self._image(slide, image_path, 7.2, 0, 6.133, SLIDE_H)
+        else:
+            self._shape(
+                slide,
+                7.2,
+                0,
+                6.133,
+                SLIDE_H,
+                self.profile.palette["accent"],
+                rounded=False,
+                opacity=0.18,
+            )
+        self._text(slide, title, 0.72, 1.05, 6.1, 1.45, role="title")
+        self._text(slide, claim, 0.76, 2.75, 5.55, 0.95, role="lead")
+        for index, point in enumerate(proof_points[:3]):
+            y = 4.25 + index * 0.65
+            self._text(
+                slide,
+                f"{index + 1:02d}",
+                0.78,
+                y,
+                0.42,
+                0.26,
+                role="caption",
+                color=self.profile.palette["accent"],
+                font_family=self.fonts["numeric"],
+            )
+            self._text(slide, point, 1.3, y - 0.04, 5.0, 0.45, role="body")
+        self._page_number(slide)
+        self._record(slide, layout, "product", ("case_visual",))
+        return slide
+
+    def add_closing(
+        self,
+        title: str,
+        points: Sequence[str],
+        *,
+        image_path: str | Path | None = None,
+    ):
+        points = self._budgeted_points(points)
+        layout = resolve_layout(
+            self.profile.level,
+            content_type="closing",
+            has_image=bool(image_path),
+        )
+        self._assert_layout(layout)
+        slide = self._new_slide()
+        self._background(slide)
+        if image_path and self.profile.level == "L4":
+            self._image(slide, image_path, 8.0, 0, 5.333, SLIDE_H)
+        self._text(
+            slide,
+            title,
+            0.72,
+            0.9,
+            7.2 if image_path and self.profile.level == "L4" else 11.5,
+            1.0,
+            role="title",
+        )
+        body = "\n".join(
+            f"{index + 1:02d}  {point}" for index, point in enumerate(points)
+        )
+        self._text(
+            slide,
+            body,
+            0.76,
+            2.2,
+            6.4 if image_path and self.profile.level == "L4" else 11.3,
+            4.0,
+            role="body",
+        )
+        self._page_number(slide)
+        self._record(slide, layout, "closing", (layout,))
+        return slide
+
+    def save(
+        self,
+        path: str | Path,
+        *,
+        audit_path: str | Path | None = None,
+    ) -> Path:
+        motion_summary = self.finalize_dynamic()
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        self.presentation.save(str(output))
+        if audit_path:
+            import json
+
+            Path(audit_path).write_text(
+                json.dumps(
+                    {
+                        "version": SKILL_VERSION,
+                        "level": self.profile.level,
+                        "strategy": self.profile.strategy.key,
+                        "style_branch": (
+                            self.style_branch.key if self.style_branch else None
+                        ),
+                        "mode": self.mode,
+                        "design_gene": self.profile.as_dict()["design_gene"],
+                        "animation_rule": self.profile.as_dict()["animation"],
+                        "template_style": self.template_style,
+                        "motion_summary": motion_summary,
+                        "slides": self.slide_audit,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        return output
+
+
+def build_level_sample(
+    level: str,
+    output_path: str | Path,
+    *,
+    image_path: str | Path | None = None,
+    style_branch: str | None = None,
+    mode: str = "static",
+    template_style: Mapping[str, Any] | None = None,
+) -> Path:
+    """Build a strategy coverage deck through the public builder API."""
+
+    result = build_strategy_sample(
+        level,
+        output_path,
+        image_path=image_path,
+        style_branch=style_branch,
+        mode=mode,
+        template_style=template_style,
+    )
+    return Path(result["artifact_path"])
+
+
+def build_strategy_sample(
+    level: str,
+    output_path: str | Path,
+    *,
+    image_path: str | Path | None = None,
+    style_branch: str | None = None,
+    mode: str = "static",
+    template_style: Mapping[str, Any] | None = None,
+) -> dict:
+    output_path = Path(output_path)
+    builder = LeveledDeckBuilder(
+        level,
+        style_branch=style_branch,
+        mode=mode,
+        template_style=template_style,
+    )
+    profile = builder.profile
+    branch_name = builder.style_branch.name if builder.style_branch else ""
+
+    builder.add_cover(
+        f"{profile.level} {profile.strategy.name}",
+        profile.strategy.objective,
+        kicker=(
+            f"{profile.level} / {profile.strategy.key.upper()}"
+            + (f" / {branch_name}" if branch_name else "")
+        ),
+        image_path=image_path,
+    )
+
+    if profile.level == "L1":
+        builder.add_content(
+            "信息完整性内容页",
+            [
+                "原始信息保持完整，不使用卡片或装饰性图形。",
+                "标题与正文共两类层级，只用一种系统无衬线字体。",
+                "简单分栏用于组织长信息，不改变原始语义。",
+            ],
+            content_type="narrative",
+            eyebrow="INFORMATION FIRST",
+            image_path=image_path,
+        )
+        builder.add_content(
+            "基础分栏",
+            [
+                "左侧保留信息段落。" if i % 2 == 0 else "右侧延续同一信息结构。"
+                for i in range(6)
+            ],
+            content_type="narrative",
+            requested_layout="simple_split",
+        )
+        builder.add_chart(
+            "基础数据图",
+            ["A", "B", "C", "D"],
+            [("指标", [12, 19, 27, 35])],
+            chart_hint="column",
+        )
+    elif profile.level == "L2":
+        builder.add_content(
+            "标准化章节结构",
+            [
+                "固定页眉页脚统一全篇阅读路径。",
+                "对称网格组织标题、模块与正文。",
+                "章节编号保持层级与顺序一致。",
+            ],
+            content_type="comparison",
+            eyebrow="STRUCTURE FIRST",
+            image_path=image_path,
+        )
+        builder.add_content(
+            "基础卡片",
+            [
+                "统一边框与色块分区。",
+                "模块标题保持固定层级。",
+                "图标仅承担识别作用。",
+            ],
+            content_type="cards",
+        )
+        builder.add_chart(
+            "正式商务图表",
+            ["Q1", "Q2", "Q3", "Q4"],
+            [("指标", [12, 19, 27, 35])],
+            chart_hint="column",
+        )
+    elif profile.level == "L3":
+        builder.add_content(
+            "结论先行的关键页",
+            [
+                "核心结论优先占据最大视觉权重。",
+                "证据模块服务结论，不做无意义装饰。",
+                "数字采用等宽字体保持比较一致。",
+                "正文控制在一屏可读范围。",
+            ],
+            content_type="narrative",
+            eyebrow="EMPHASIS FIRST",
+        )
+        builder.add_metric_cards(
+            "关键指标卡",
+            [
+                ("完成率", "92%", "测试样本"),
+                ("周期", "6 周", "计划值"),
+                ("覆盖", "12 列", "标准网格"),
+                ("组件", "7 类", "版式库"),
+            ],
+            insight="指标卡只保留可验证的数值、单位与口径。",
+            eyebrow="METRICS",
+        )
+        builder.add_data_dashboard(
+            "数据看板",
+            [
+                ("总量", "35", "单位：件"),
+                ("增幅", "19%", "相对上期"),
+                ("完成", "92%", "目标占比"),
+            ],
+            ["Q1", "Q2", "Q3", "Q4"],
+            [("完成量", [12, 19, 27, 35])],
+            insight="测试数据仅用于验证原生图表与版式组件。",
+            eyebrow="DASHBOARD",
+            chart_hint="bar",
+        )
+        builder.add_process_steps(
+            "流程步骤",
+            [
+                ("定义目标", "明确受众与结论。"),
+                ("组织证据", "匹配内容与数据。"),
+                ("生成页面", "调用标准组件。"),
+                ("渲染审查", "检查实际输出。"),
+            ],
+            eyebrow="PROCESS",
+        )
+        builder.add_timeline(
+            "项目时间轴",
+            [
+                ("W1", "定义", "确认范围和策略。"),
+                ("W2", "设计", "完成页面矩阵。"),
+                ("W3", "生成", "构建原生对象。"),
+                ("W4", "验收", "逐页审查修复。"),
+            ],
+            eyebrow="TIMELINE",
+        )
+        builder.add_icon_text_modules(
+            "图标文字模块",
+            [
+                ("结构", "用网格建立稳定版式。"),
+                ("数据", "用原生图表承载证据。"),
+                ("案例", "用真实素材支撑叙事。"),
+            ],
+            eyebrow="MODULES",
+        )
+        builder.add_architecture_compare(
+            "架构对比",
+            "现状",
+            ["标题与正文层级混杂", "版式依赖重复卡片", "数据缺少可读口径"],
+            "目标",
+            ["四级层级稳定", "标准组件组合", "证据与结论对应"],
+            eyebrow="ARCHITECTURE",
+        )
+        builder.add_case_study(
+            "案例图文",
+            "原有页面缺少视觉重点。",
+            "按证据类型选择标准版式。",
+            "结论、证据与素材形成单一视觉中心。",
+            eyebrow="CASE",
+            image_path=image_path,
+        )
+    else:
+        builder.add_content(
+            "主题叙事页",
+            [
+                "主题视觉符号贯穿整套内容。",
+                "构图围绕叙事节点变化。",
+                "信息为视觉叙事提供事实支撑。",
+            ],
+            content_type="narrative",
+            requested_layout="asymmetric_narrative",
+            eyebrow=f"THEME / {branch_name.upper()}",
+            image_path=image_path,
+        )
+        builder.add_content(
+            "编辑式构图",
+            [
+                "大图与文字建立非对称关系。",
+                "跨页呼应保持主题识别度。",
+                "自由构图不脱离内容层级。",
+            ],
+            content_type="case",
+            requested_layout="editorial_collage",
+            image_path=image_path,
+        )
+        builder.add_timeline(
+            "叙事时间轴",
+            [
+                ("01", "进入主题", "建立情境。"),
+                ("02", "展开证据", "形成转折。"),
+                ("03", "落到结果", "完成收束。"),
+            ],
+            eyebrow="NARRATIVE",
+        )
+        if style_branch == "product_roadshow":
+            builder.add_product_roadshow(
+                "产品路演",
+                "清晰展示核心价值与真实证据。",
+                ["真实产品素材", "单一价值主张", "跨页记忆色"],
+                image_path=image_path,
+            )
+        else:
+            builder.add_content(
+                "定制信息图",
+                [
+                    "主题色与图形语言保持一致。",
+                    "信息图承担比较与解释任务。",
+                ],
+                content_type="data",
+                requested_layout="custom_infographic",
+            )
+    builder.add_section(
+        "主题章节",
+        "章节页承接叙事转折，并使用同一主题视觉系统。",
+        image_path=image_path,
+    )
+    if profile.level == "L4":
+        builder.add_chart(
+            "主题图表",
+            ["A", "B", "C", "D"],
+            [("指标", [12, 19, 27, 35])],
+            chart_hint=profile.charts.preferred_types[0],
+        )
+    builder.add_closing(
+        "策略收束",
+        [
+            "场景目标决定表达策略。",
+            "版式与组件由权限配置控制。",
+            "视觉结论来自实际逐页审查。",
+        ],
+        image_path=image_path,
+    )
+    audit = {
+        "version": SKILL_VERSION,
+        "level": profile.level,
+        "strategy": profile.strategy.key,
+        "style_branch": builder.style_branch.key if builder.style_branch else None,
+        "slides": builder.slide_audit,
+    }
+    path = builder.save(output_path)
+    return {"artifact_path": str(path), "audit": audit}

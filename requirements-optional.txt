@@ -1,0 +1,8 @@
+# Better palette extraction and visual similarity. The core parser has
+# dependency-free fallbacks and reports missing optional capabilities.
+colorthief>=0.2.1
+fonttools>=4.0
+opencv-python>=4.8
+moviepy>=1.0
+scikit-learn>=1.3
+PyYAML>=6.0
